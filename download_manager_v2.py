@@ -1435,9 +1435,24 @@ class AccountScheduler:
                     logger.info(f"[Daemon] 发送ShutdownRequest到: {account_id}")
 
                     if ipc:
+                        # [FIX-2026-08-28-SHUTDOWN-MESSAGE-ID] 与 _submit_to_daemon 中
+                        # DownloadRequestV2 的修复方式一致：ShutdownRequest 是业务协议
+                        # 对象（只有 request_id），send_with_ack() 需要的是传输层
+                        # IPCMessage（要求 message_id）。之前直接把 ShutdownRequest
+                        # 传给 send_with_ack()，导致其内部访问 message.message_id 时
+                        # 抛出 AttributeError，关闭请求发送失败，进而总是走到强制kill。
+                        from download_ipc import IPCMessage, MessageType
+
+                        ipc_message = IPCMessage(
+                            message_id=request.request_id,  # 复用 request_id 作为 message_id
+                            message_type=MessageType.SHUTDOWN_REQUEST,
+                            timestamp=request.timestamp,
+                            payload=request.to_dict(),
+                        )
+
                         # 发送关闭请求并等待ACK (timeout=5秒)
                         try:
-                            await ipc.send_with_ack(request, timeout=5.0)
+                            await ipc.send_with_ack(ipc_message, timeout=5.0)
                             logger.info(f"[Daemon] ShutdownRequest已发送")
 
                             # 等待daemon优雅关闭（最多10秒）
