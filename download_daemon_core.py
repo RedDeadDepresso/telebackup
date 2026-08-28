@@ -576,6 +576,9 @@ class DaemonCore:
                 "msg_id": request.msg_id,
                 "save_path": request.save_path,
             }
+            # [FIX-2026-08-28-PERSISTENT-DC-POOL] 有新任务到达，取消任何
+            # 待触发的 DC 连接池空闲清理，确保该任务能复用现有连接。
+            self._cancel_pending_dc_pool_cleanup()
             self.state = DaemonState.DOWNLOADING
             download_start = time.time()
 
@@ -700,6 +703,9 @@ class DaemonCore:
             "total_parts": 0,
             "temp_path": "",
         }
+        # [FIX-2026-08-28-PERSISTENT-DC-POOL] 有新任务到达，取消任何
+        # 待触发的 DC 连接池空闲清理，确保该任务能复用现有连接。
+        self._cancel_pending_dc_pool_cleanup()
         # [FIX-CANCEL-2026-02-16] 创建取消事件
         self._cancel_events[request_id] = asyncio.Event()
 
@@ -1505,7 +1511,7 @@ class DaemonCore:
         return clients
 
     async def _cleanup_client_pool(self, clients: list):
-        """清理连接池（包括主池连接 + 全局 DC 专用连接池）"""
+        """清理连接池（仅主池连接；全局 DC 专用连接池改为惰性清理，见 _schedule_dc_pool_idle_cleanup）"""
         # 1. 断开主池连接
         for client in clients:
             if client != self.client:  # 不要关闭主客户端
@@ -1514,13 +1520,64 @@ class DaemonCore:
                 except Exception:
                     pass
 
-        # 2. [FIX-2026-02-14-ZOMBIE-DC] 清理全局 DC 专用连接池，防止僵尸连接
-        #    销毁重建策略下，下载完成后不应有任何残留 DC 连接
-        try:
-            from download_pool import cleanup_global_dc_pools
-            await cleanup_global_dc_pools()
-        except Exception as dc_err:
-            logger.warning(f"[Cleanup] DC 连接池清理失败（非致命）: {dc_err}")
+        # 2. [FIX-2026-08-28-PERSISTENT-DC-POOL] 不再于每次任务完成后立即销毁
+        #    全局 DC 专用连接池。销毁重建策略虽然能避免僵尸连接，但代价是
+        #    每个文件都要重新付出一次完整的跨 DC 握手开销（导出/导入授权 +
+        #    4 条连接，实测约 8~9 秒），在批量下载场景下是主要瓶颈。
+        #
+        #    新策略：
+        #      - 只要 daemon 仍有其他活跃任务（self.active_tasks 非空），
+        #        DC 连接池必然还会被用到，直接跳过清理。
+        #      - 当 daemon 变为空闲（没有活跃任务）时，不要立即清理，而是
+        #        安排一个短暂的宽限期（_DC_POOL_IDLE_GRACE_SECONDS）。如果
+        #        宽限期内又有新任务用到同一个 DC 连接池，清理会被取消，
+        #        连接得以复用；如果宽限期内始终没有新任务，才真正断开，
+        #        避免真正的僵尸连接常驻。
+        if self.active_tasks:
+            logger.info(
+                f"[Cleanup] 仍有 {len(self.active_tasks)} 个活跃任务，"
+                "保留全局 DC 连接池以供复用"
+            )
+            return
+
+        self._schedule_dc_pool_idle_cleanup()
+
+    # [FIX-2026-08-28-PERSISTENT-DC-POOL] 全局 DC 连接池空闲宽限期（秒）。
+    # 宽限期内若有新下载任务到达，会复用现有连接池，跳过约 8~9 秒的跨 DC
+    # 握手开销；宽限期结束后仍无新任务，才真正释放连接，避免僵尸连接常驻。
+    _DC_POOL_IDLE_GRACE_SECONDS = 90
+
+    def _cancel_pending_dc_pool_cleanup(self):
+        """取消尚未触发的 DC 连接池空闲清理任务（若存在）。"""
+        existing = getattr(self, "_dc_pool_cleanup_task", None)
+        if existing is not None and not existing.done():
+            existing.cancel()
+
+    def _schedule_dc_pool_idle_cleanup(self):
+        """安排（或重置）一次延迟的全局 DC 连接池清理任务。"""
+        # 取消上一次尚未触发的清理任务（例如两次下载之间又提交了新任务）
+        self._cancel_pending_dc_pool_cleanup()
+
+        async def _delayed_cleanup():
+            try:
+                await asyncio.sleep(self._DC_POOL_IDLE_GRACE_SECONDS)
+            except asyncio.CancelledError:
+                return
+            # 再次确认 daemon 仍然空闲（宽限期内可能有新任务到达并已完成）
+            if self.active_tasks:
+                logger.info("[Cleanup] 宽限期结束时发现新任务，取消 DC 连接池清理")
+                return
+            try:
+                from download_pool import cleanup_global_dc_pools
+                logger.info(
+                    f"[Cleanup] 空闲 {self._DC_POOL_IDLE_GRACE_SECONDS}s 无新任务，"
+                    "清理全局 DC 连接池"
+                )
+                await cleanup_global_dc_pools()
+            except Exception as dc_err:
+                logger.warning(f"[Cleanup] DC 连接池清理失败（非致命）: {dc_err}")
+
+        self._dc_pool_cleanup_task = asyncio.create_task(_delayed_cleanup())
 
     async def _send_event(self, message_type: 'MessageType', payload: Dict[str, Any]):
         """发送事件到主进程"""
@@ -1830,6 +1887,19 @@ class DaemonCore:
                 except Exception as e:
                     logger.debug(f"[Shutdown] tracked client disconnect failed: {e}")
             self._tracked_clients.clear()
+
+            # 步骤3.5：[FIX-2026-08-28-PERSISTENT-DC-POOL] daemon 真正关闭时，
+            # 全局 DC 专用连接池不会再被任何任务复用，在此处一次性清理，
+            # 同时取消尚未触发的空闲清理定时任务（避免重复清理/异常）。
+            pending_dc_cleanup = getattr(self, "_dc_pool_cleanup_task", None)
+            if pending_dc_cleanup is not None and not pending_dc_cleanup.done():
+                pending_dc_cleanup.cancel()
+            try:
+                from download_pool import cleanup_global_dc_pools
+                logger.info("[Shutdown] 清理全局 DC 连接池...")
+                await cleanup_global_dc_pools()
+            except Exception as dc_err:
+                logger.warning(f"[Shutdown] DC 连接池清理失败（非致命）: {dc_err}")
 
             # 步骤4：关闭 CheckpointManager
             if self.checkpoint_manager:
