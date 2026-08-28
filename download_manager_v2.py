@@ -1399,21 +1399,6 @@ class AccountScheduler:
                 f"[Daemon] 关闭进程: {account_id} (save_state={save_state})"
             )
 
-            # ✅ [FIX-2026-02-01] 步骤0：停止 IPC 接收循环
-            # 【原因】Daemon 关闭前，应先停止后台接收任务
-            # 【处理】取消 IPC 接收任务，防止异常
-            if hasattr(self, 'ipc_receive_tasks'):
-                receive_task = self.ipc_receive_tasks.pop(account_id, None)
-                if receive_task and not receive_task.done():
-                    logger.info(f"[Daemon] 取消 IPC 接收任务: {account_id}")
-                    receive_task.cancel()
-                    try:
-                        await receive_task
-                    except asyncio.CancelledError:
-                        logger.info(f"[Daemon] IPC 接收任务已取消: {account_id}")
-                    except Exception as e:
-                        logger.error(f"[Daemon] 取消接收任务异常: {e}")
-
             # 步骤1：获取daemon对象
             daemon = self.account_daemons.get(account_id)
             ipc = self.ipc_channels.get(account_id)
@@ -1435,25 +1420,29 @@ class AccountScheduler:
                     logger.info(f"[Daemon] 发送ShutdownRequest到: {account_id}")
 
                     if ipc:
-                        # [FIX-2026-08-28-SHUTDOWN-MESSAGE-ID] 与 _submit_to_daemon 中
-                        # DownloadRequestV2 的修复方式一致：ShutdownRequest 是业务协议
-                        # 对象（只有 request_id），send_with_ack() 需要的是传输层
-                        # IPCMessage（要求 message_id）。之前直接把 ShutdownRequest
-                        # 传给 send_with_ack()，导致其内部访问 message.message_id 时
-                        # 抛出 AttributeError，关闭请求发送失败，进而总是走到强制kill。
                         from download_ipc import IPCMessage, MessageType
 
                         ipc_message = IPCMessage(
-                            message_id=request.request_id,  # 复用 request_id 作为 message_id
+                            message_id=request.request_id,
                             message_type=MessageType.SHUTDOWN_REQUEST,
                             timestamp=request.timestamp,
                             payload=request.to_dict(),
                         )
 
-                        # 发送关闭请求并等待ACK (timeout=5秒)
-                        try:
-                            await ipc.send_with_ack(ipc_message, timeout=5.0)
-                            logger.info(f"[Daemon] ShutdownRequest已发送")
+                        # [FIX-2026-08-28-SHUTDOWN-ACK-DEADLOCK] 之前在这里之前
+                        # （步骤0）就取消了 IPC 接收循环任务。但 send_with_ack()
+                        # 本身不读取 socket，它只是发送消息后在一个 Future 上
+                        # await；这个 Future 只会被接收循环任务在收到
+                        # ACK_MESSAGE 时 set_result()。接收循环一旦被提前取消，
+                        # 之后无论 daemon 多快回 ACK，这个 Future 都不会再被
+                        # 解析，send_with_ack() 保证 100% 超时（而不是偶发）。
+                        #
+                        # 现在保留接收循环直到我们真正不再需要它（ACK 等待 +
+                        # 优雅关闭轮询结束）之后，再取消，见下方步骤2.5。
+                        ack_received = await ipc.send_with_ack(ipc_message, timeout=5.0)
+
+                        if ack_received:
+                            logger.info(f"[Daemon] ShutdownRequest已发送并收到ACK")
 
                             # 等待daemon优雅关闭（最多10秒）
                             for i in range(10):
@@ -1461,12 +1450,25 @@ class AccountScheduler:
                                     logger.info(f"[Daemon] Daemon已优雅关闭")
                                     break
                                 await asyncio.sleep(1)
-
-                        except asyncio.TimeoutError:
+                        else:
                             logger.warning(f"[Daemon] ShutdownRequest超时，准备强制关闭")
 
                 except Exception as e:
                     logger.error(f"[Daemon] 发送关闭请求失败: {e}")
+
+            # 步骤2.5：[FIX-2026-08-28-SHUTDOWN-ACK-DEADLOCK] 关闭请求的ACK等待
+            # 和优雅关闭轮询都已结束，现在才安全地停止 IPC 接收循环。
+            if hasattr(self, 'ipc_receive_tasks'):
+                receive_task = self.ipc_receive_tasks.pop(account_id, None)
+                if receive_task and not receive_task.done():
+                    logger.info(f"[Daemon] 取消 IPC 接收任务: {account_id}")
+                    receive_task.cancel()
+                    try:
+                        await receive_task
+                    except asyncio.CancelledError:
+                        logger.info(f"[Daemon] IPC 接收任务已取消: {account_id}")
+                    except Exception as e:
+                        logger.error(f"[Daemon] 取消接收任务异常: {e}")
 
             # 步骤3：强制kill（如果进程仍在运行）
             if daemon.is_running():
