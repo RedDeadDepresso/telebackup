@@ -1223,11 +1223,89 @@ class AccountScheduler:
                         f"[IPC-Receiver] 接收消息异常: {e}",
                         exc_info=True
                     )
-                    # 短暂等待后继续
-                    await asyncio.sleep(0.5)
+
+                    # [FIX-2026-08-28-IPC-RECONNECT] 之前这里只是 sleep(0.5) 再
+                    # continue，但一旦底层 socket 真正断开
+                    # （connected=False），receive() 会在每次调用时立即抛出
+                    # ConnectionError("IPC通道未连接")，导致本循环无限重复同一个
+                    # 异常，永远无法恢复，也永远不会真正退出（除非外部取消任务）。
+                    #
+                    # 现在检测到连接已断开时，主动尝试重连（带次数上限和指数退
+                    # 避），并在重连前先确认 daemon 进程本身是否还活着——如果
+                    # daemon 已经不在了，重连注定失败，此时应尽快放弃并退出循环，
+                    # 而不是无意义地反复重试。
+                    if not ipc.is_connected():
+                        daemon = self.account_daemons.get(account_id)
+                        daemon_alive = daemon is not None and daemon.is_running()
+
+                        if not daemon_alive:
+                            logger.error(
+                                f"[IPC-Receiver] IPC连接已断开且 daemon 进程"
+                                f"已不在运行 (account_id={account_id})，"
+                                "放弃重连，停止接收循环"
+                            )
+                            break
+
+                        reconnected = await self._reconnect_ipc(ipc, account_id)
+                        if not reconnected:
+                            logger.error(
+                                f"[IPC-Receiver] 多次重连失败，停止接收循环: "
+                                f"{account_id}"
+                            )
+                            break
+                    else:
+                        # 连接仍然正常，只是单次收发出现瞬时异常，短暂等待后继续
+                        await asyncio.sleep(0.5)
 
         finally:
             logger.info(f"[IPC-Receiver] 接收循环已停止: {account_id}")
+
+    async def _reconnect_ipc(
+        self, ipc: 'IPCChannel', account_id: str,
+        max_attempts: int = 5, base_delay: float = 1.0,
+    ) -> bool:
+        """
+        [FIX-2026-08-28-IPC-RECONNECT] 尝试重建与 daemon 之间的 IPC 连接。
+
+        用于 _start_ipc_receive_loop 检测到底层 socket 断开
+        （例如 Windows 上偶发的 [WinError 64] 网络名不再可用）之后的恢复逻辑。
+        带指数退避，达到 max_attempts 后放弃并返回 False。
+
+        Returns:
+            True 表示重连成功，False 表示已达最大重试次数仍未恢复。
+        """
+        delay = base_delay
+        for attempt in range(1, max_attempts + 1):
+            logger.warning(
+                f"[IPC-Receiver] 检测到连接断开，尝试重连 "
+                f"({attempt}/{max_attempts}): {account_id}"
+            )
+            try:
+                # 先清理旧的（已失效的）连接资源，再重新建立客户端连接
+                try:
+                    await ipc.close()
+                except Exception:
+                    pass  # 旧连接可能已经失效，忽略关闭时的异常
+
+                await ipc.connect(is_server=False)
+
+                if ipc.is_connected():
+                    logger.info(
+                        f"[IPC-Receiver] 重连成功 "
+                        f"(尝试 {attempt}/{max_attempts}): {account_id}"
+                    )
+                    return True
+
+            except Exception as e:
+                logger.warning(
+                    f"[IPC-Receiver] 重连尝试 {attempt}/{max_attempts} 失败: {e}"
+                )
+
+            if attempt < max_attempts:
+                await asyncio.sleep(delay)
+                delay *= 2  # 指数退避
+
+        return False
 
     async def _handle_progress_event(self, message: 'IPCMessage', account_id: str):
         """处理进度事件"""
