@@ -113,6 +113,9 @@ class DaemonCore:
         self._tasks_lock = asyncio.Lock()
         # [FIX-CANCEL-2026-02-16] 每个任务的取消事件
         self._cancel_events: Dict[str, asyncio.Event] = {}  # request_id -> cancel_event
+        # [FIX-2026-08-28-SHUTDOWN-CANCEL] request_id -> asyncio.Task，用于优雅
+        # 关闭时实际等待下载任务退出，而不仅仅是设置取消事件后就不管了。
+        self._download_tasks: Dict[str, asyncio.Task] = {}
 
         # 启动时间
         self.start_time = time.time()
@@ -415,7 +418,18 @@ class DaemonCore:
             if message_type == MessageType.DOWNLOAD_REQUEST:
                 # [FIX-CANCEL-2026-02-16] 用 create_task 替代 await，避免阻塞主循环
                 # 阻塞主循环会导致无法接收后续的取消/心跳/关闭消息
-                asyncio.create_task(self._handle_download_request(message))
+                #
+                # [FIX-2026-08-28-SHUTDOWN-CANCEL] 保存 Task 引用，供
+                # _handle_shutdown_request 在关闭时实际等待任务退出使用
+                # （此前只是 fire-and-forget，下载任务在优雅关闭后仍会
+                # 在后台继续运行，直到自然完成或被强制 kill 进程打断）。
+                dl_request_id = message.payload.get("request_id")
+                dl_task = asyncio.create_task(self._handle_download_request(message))
+                if dl_request_id:
+                    self._download_tasks[dl_request_id] = dl_task
+                    dl_task.add_done_callback(
+                        lambda t, rid=dl_request_id: self._download_tasks.pop(rid, None)
+                    )
 
             elif message_type == MessageType.CANCEL_DOWNLOAD_REQUEST:
                 # [FIX-CANCEL-2026-02-16] 处理取消请求
@@ -1760,10 +1774,55 @@ class DaemonCore:
             f"[Shutdown] 收到关闭请求 (save_state={request.save_state})"
         )
 
-        # 标记关闭
+        # 标记关闭：阻止主循环继续接收新的 IPC 消息 / 提交新任务
         self.shutdown_requested = True
 
-        # 如果需要保存状态
+        # [FIX-2026-08-28-SHUTDOWN-CANCEL] 此前这里只是设置了 shutdown_requested
+        # 标志并保存 checkpoint，从未真正取消正在运行的下载任务 —— 而
+        # shutdown_requested 只在 run() 的顶层 IPC 接收循环中被检查，与已经通过
+        # asyncio.create_task() 独立运行的下载 WorkerPool 毫无关联。结果是：
+        # 优雅关闭请求发出后，正在下载的文件会在后台继续跑，直到自然完成，
+        # 或者被主进程那边等待超时后的强制 kill 进程打断——两种情况都不是
+        # "优雅关闭"应有的行为。
+        #
+        # 现在复用 _handle_cancel_request 中已经验证可用的取消机制
+        # （cancel_event.set() + WorkerPool.cancel()），对 active_tasks 中的
+        # 每一个任务发起取消，然后实际 await 对应的下载 Task（存于
+        # self._download_tasks），确保 worker 真正退出之后，再保存最终的
+        # checkpoint 状态。
+        if self.active_tasks:
+            logger.info(
+                f"[Shutdown] 取消 {len(self.active_tasks)} 个正在运行的下载任务..."
+            )
+            for request_id, task_info in list(self.active_tasks.items()):
+                cancel_event = self._cancel_events.get(request_id)
+                if cancel_event:
+                    cancel_event.set()
+
+                wp = task_info.get("worker_pool")
+                if wp and hasattr(wp, "cancel"):
+                    wp.cancel()
+
+            # 等待所有下载 Task 真正退出（有超时保护，避免关闭流程被卡住）
+            pending_tasks = [
+                t for t in self._download_tasks.values() if not t.done()
+            ]
+            if pending_tasks:
+                logger.info(
+                    f"[Shutdown] 等待 {len(pending_tasks)} 个下载任务退出"
+                    "（最多10秒）..."
+                )
+                done, pending = await asyncio.wait(
+                    pending_tasks, timeout=10.0
+                )
+                if pending:
+                    logger.warning(
+                        f"[Shutdown] {len(pending)} 个下载任务未能在超时内退出，"
+                        "继续关闭流程（checkpoint 中的进度可能略微落后于实际状态）"
+                    )
+
+        # 如果需要保存状态（此时任务已停止或已超时放弃等待，checkpoint 反映
+        # 尽可能接近最终的完成状态）
         if request.save_state:
             await self.save_checkpoints()
 
