@@ -798,6 +798,80 @@ class AccountScheduler:
         logger.info(f"[Scheduler] 启动Daemon: {account_id}")
         await self._start_daemon(account_id)
 
+    async def _cleanup_orphan_daemon(self, account_id: str, pidfile_path: str) -> None:
+        """
+        [FIX-2026-08-28-ORPHAN-DAEMON-CLEANUP] 检查并清理上次未正常退出、
+        仍占用 IPC 端口的旧 daemon 进程。
+
+        读取 pidfile 中记录的 PID：
+          - 文件不存在 / 无法解析 → 视为无残留，直接返回。
+          - 记录的 PID 已不存在（进程已退出）→ 陈旧 pidfile，无需处理。
+          - 记录的 PID 仍在运行 → 先尝试温和终止（terminate），等待其退出；
+            超时仍未退出则强制杀死（kill）。
+        """
+        import psutil
+
+        if not os.path.exists(pidfile_path):
+            return
+
+        try:
+            with open(pidfile_path, "r", encoding="utf-8") as pf:
+                old_pid_str = pf.read().strip()
+            old_pid = int(old_pid_str) if old_pid_str else None
+        except Exception as e:
+            logger.warning(f"[Daemon-Cleanup] 读取 pidfile 失败（忽略）: {e}")
+            return
+
+        if not old_pid:
+            return
+
+        try:
+            if not psutil.pid_exists(old_pid):
+                logger.info(
+                    f"[Daemon-Cleanup] pidfile 中记录的进程已不存在 "
+                    f"(PID={old_pid})，视为陈旧 pidfile"
+                )
+                return
+
+            old_proc = psutil.Process(old_pid)
+            # 简单校验一下这确实像是我们自己的 daemon 进程（防止 PID 被操作系统
+            # 复用给了完全不相关的进程），通过检查命令行中是否包含
+            # download_daemon.py 和该 account_id。
+            try:
+                cmdline = " ".join(old_proc.cmdline())
+            except Exception:
+                cmdline = ""
+
+            if "download_daemon.py" not in cmdline:
+                logger.info(
+                    f"[Daemon-Cleanup] PID={old_pid} 已被其他进程复用，"
+                    "非残留 daemon，忽略"
+                )
+                return
+
+            logger.warning(
+                f"[Daemon-Cleanup] 检测到残留的旧 daemon 进程 "
+                f"(PID={old_pid}, account={account_id})，尝试清理以释放 IPC 端口"
+            )
+
+            try:
+                old_proc.terminate()
+                old_proc.wait(timeout=5)
+                logger.info(f"[Daemon-Cleanup] 旧进程已正常终止 (PID={old_pid})")
+            except psutil.TimeoutExpired:
+                logger.warning(
+                    f"[Daemon-Cleanup] 旧进程未在超时内退出，强制杀死 (PID={old_pid})"
+                )
+                old_proc.kill()
+                old_proc.wait(timeout=5)
+                logger.info(f"[Daemon-Cleanup] 旧进程已强制杀死 (PID={old_pid})")
+
+        except psutil.NoSuchProcess:
+            # 在检查过程中进程自己退出了，属于正常情况
+            pass
+        except Exception as e:
+            logger.warning(f"[Daemon-Cleanup] 清理残留进程失败（非致命）: {e}")
+
     async def _start_daemon(self, account_id: str):
         """
         启动账号的Daemon进程
@@ -882,6 +956,30 @@ class AccountScheduler:
 
             logger.info(f"[Daemon] IPC路径: {ipc_socket}")
 
+            # [FIX-2026-08-28-ORPHAN-DAEMON-CLEANUP] 在启动新 daemon 之前，检测并清理
+            # 可能残留的旧 daemon 进程。
+            #
+            # 【问题背景】
+            # 如果上一次运行时应用被强制关闭（force-kill / 崩溃），旧的 daemon 子进程
+            # 可能不会随之退出（尤其在 Windows 上，子进程可能成为孤儿进程继续运行）。
+            # 下次启动时，新 daemon 尝试 bind 同一个 TCP 端口会失败：
+            #
+            #   OSError: [WinError 10048] 通常每个套接字地址
+            #   （协议/网络地址/端口）只允许使用一次
+            #
+            # 而主进程侧的 IPC 客户端此时反而会"连接成功"——因为它连上的其实是那个
+            # 仍在监听同一端口的僵尸 daemon，而不是刚刚崩溃的新 daemon。这会导致后续
+            # 所有下载请求要么无响应，要么触发我们在 _start_ipc_receive_loop 中新增
+            # 的重连逻辑，最终因为"新daemon"早已崩溃退出而放弃重连。
+            #
+            # 【修复】维护一个每账号的 pidfile（与 session 文件同目录），启动前检查：
+            #   - pidfile 不存在 → 正常启动
+            #   - pidfile 存在但记录的 PID 已不在运行 → 陈旧 pidfile，忽略并覆盖
+            #   - pidfile 存在且 PID 仍在运行 → 说明是上次未正常退出的旧 daemon，
+            #     先尝试终止它（先温和终止，超时后强制杀死），再继续启动新 daemon。
+            pidfile_path = f"{session_daemon_path}.pid"
+            await self._cleanup_orphan_daemon(account_id, pidfile_path)
+
             # 步骤3：启动daemon subprocess
             log_level = self.config.get('daemon_log_level', 'INFO')
             watchdog_timeout = self.config.get('daemon_watchdog_timeout', 60)
@@ -938,6 +1036,15 @@ class AccountScheduler:
             )
 
             logger.info(f"[Daemon] 进程已启动 PID={process.pid}")
+
+            # [FIX-2026-08-28-ORPHAN-DAEMON-CLEANUP] 记录 pidfile，供下次启动时
+            # 检测并清理未正常退出的旧进程使用。
+            try:
+                with open(pidfile_path, "w", encoding="utf-8") as pf:
+                    pf.write(str(process.pid))
+            except Exception as pidfile_err:
+                logger.warning(f"[Daemon] 写入 pidfile 失败（非致命）: {pidfile_err}")
+
             # [LOG] Drain daemon stdout/stderr for diagnostics (ACK timeouts, IPC errors)
             _start_daemon_pipe_logger(process, f"(PID={process.pid}, account={account_id})")
 
