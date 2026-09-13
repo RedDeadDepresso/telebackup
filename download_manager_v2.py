@@ -15,6 +15,7 @@
 
 import asyncio
 import logging
+import multiprocessing
 import os
 import shutil
 import subprocess
@@ -146,6 +147,63 @@ def _start_daemon_pipe_logger(process: subprocess.Popen, tag: str):
     if process.stderr:
         t_err = threading.Thread(target=_reader, args=(process.stderr, "stderr"), daemon=True)
         t_err.start()
+
+
+class _MultiprocessingDaemonHandle:
+    """
+    [FIX-2026-09-13-FROZEN-DAEMON-ENTRYPOINT] 对 multiprocessing.Process 的
+    薄封装，暴露与 subprocess.Popen 兼容的最小接口子集
+    （.pid / .poll() / .kill() / .wait(timeout)）。
+
+    背景：当宿主应用被 PyInstaller 等工具打包为 frozen exe 时，
+    sys.executable 指向宿主自身编译出的可执行文件而非通用 Python 解释器，
+    此时不能再用 `subprocess.Popen([sys.executable, "download_daemon.py", ...])`
+    这种把脚本路径当命令行参数传给解释器的方式启动 daemon —— 宿主 exe 会把
+    该路径当成自己的第一个位置参数去解析，触发 "invalid choice" 用法错误
+    后立即退出，IPC 端口上根本没有东西在监听
+    （对应 [WinError 1225] The remote computer refused the network connection）。
+
+    multiprocessing.Process 在 spawn 模式下会正确地重新执行宿主自身的 exe，
+    并在子进程中直接调用 download_daemon.run_daemon_process()，完全绕开
+    "某个 .py 文件路径" 这一在 frozen 环境下已不成立的假设，且不经过
+    argparse/sys.argv，因此也不存在参数解析出错的可能。
+
+    本类的存在只是为了让下游依赖 subprocess.Popen 接口的既有代码
+    （DaemonProcess.is_running() / 强制kill逻辑等）在两种启动方式之间
+    无需任何改动即可透明工作；非 frozen 场景下的 subprocess.Popen 路径
+    完全不受影响。
+    """
+
+    def __init__(self, mp_process: 'multiprocessing.Process'):
+        self._mp_process = mp_process
+        # 与 subprocess.Popen 保持一致：管道未使用，供
+        # _start_daemon_pipe_logger 的 `if process.stdout:` 判断直接跳过。
+        self.stdout = None
+        self.stderr = None
+
+    @property
+    def pid(self) -> Optional[int]:
+        return self._mp_process.pid
+
+    def poll(self) -> Optional[int]:
+        """
+        与 subprocess.Popen.poll() 语义一致：进程仍在运行返回 None，
+        否则返回退出码。multiprocessing.Process.exitcode 本身就已经是
+        "运行中为 None，退出后为 int" 的语义，直接透传即可。
+        """
+        return self._mp_process.exitcode
+
+    def kill(self) -> None:
+        self._mp_process.kill()
+
+    def terminate(self) -> None:
+        self._mp_process.terminate()
+
+    def wait(self, timeout: Optional[float] = None) -> int:
+        self._mp_process.join(timeout)
+        if self._mp_process.is_alive():
+            raise subprocess.TimeoutExpired(cmd="daemon(mp)", timeout=timeout)
+        return self._mp_process.exitcode
 
 
 # ==================== 数据模型 ====================
@@ -987,23 +1045,9 @@ class AccountScheduler:
             # 设置统一日志（主进程 + daemon 共享同一个日志文件）
             self._setup_unified_logging(account_id)
 
-            daemon_script = os.path.join(os.path.dirname(__file__), 'download_daemon.py')
-            cmd = [
-                sys.executable,
-                daemon_script,
-                '--session', session_daemon_path,
-                '--account-id', account_id,
-                '--ipc-socket', ipc_socket,
-                '--log-level', log_level,
-                '--watchdog-timeout', str(watchdog_timeout),
-                '--api-id', str(self.config.get('api_id', 0)),
-                '--api-hash', self.config.get('api_hash', ''),
-            ]
-            # 传递统一日志路径给 daemon
-            if self._unified_log_path:
-                cmd.extend(['--log-file', self._unified_log_path])
+            api_id = self.config.get('api_id', 0)
+            api_hash = self.config.get('api_hash', '')
 
-            logger.info(f"[Daemon] 启动命令: {' '.join(cmd)}")
             # [FIX-2026-02-01] Force UTF-8 for daemon stdio to avoid GBK decode errors/garbled logs.
             popen_env = os.environ.copy()
             popen_env.setdefault("PYTHONUTF8", "1")
@@ -1017,23 +1061,102 @@ class AccountScheduler:
             popen_env["DOWNLOAD_LOG_DISABLE_FILES"] = "0"
             popen_env["DOWNLOAD_LOG_BOTH"] = "1"
 
-            # [DISABLED-2026-02-01] Legacy Popen without explicit encoding/env caused GBK decode failures.
-            # process = subprocess.Popen(
-            #     cmd,
-            #     stdout=subprocess.PIPE,
-            #     stderr=subprocess.PIPE,
-            #     text=True
-            # )
+            # [FIX-2026-09-13-FROZEN-DAEMON-ENTRYPOINT]
+            #
+            # 【问题】当宿主应用被 PyInstaller 等工具打包为 frozen exe 后，
+            # sys.executable 指向宿主自身编译出的可执行文件（例如
+            # kkafio_cli.exe），而不再是通用的 Python 解释器。此前这里
+            # 始终用 `subprocess.Popen([sys.executable, daemon_script, ...])`
+            # 启动 daemon —— 在源码/venv 环境下这没问题（sys.executable 是
+            # python.exe），但在 frozen 环境下，宿主 exe 会把 daemon_script
+            # 的路径当成自己的第一个位置参数去解析，触发
+            # "invalid choice: '...download_daemon.py'" 用法错误后立即退出。
+            # daemon 进程实际上从未真正启动，IPC 端口上也就没有任何东西在
+            # 监听，主进程侧随后所有的连接尝试都会收到
+            # [WinError 1225] The remote computer refused the network connection。
+            #
+            # 【修复】在 frozen 模式下改用 multiprocessing.Process 直接调用
+            # download_daemon.run_daemon_process()（一个不依赖 argparse/
+            # sys.argv、可被 pickle 的模块级函数）。multiprocessing 在
+            # spawn 模式下会正确地重新执行宿主自身的 exe 并在子进程中运行
+            # 指定的 Python 函数，完全不依赖"某个 .py 文件路径"这一在
+            # frozen 场景下已不成立的假设。非 frozen（源码/venv）场景下的
+            # 行为保持完全不变，依旧使用 subprocess.Popen。
+            #
+            # 【注意】宿主应用需要在自身入口点（`if __name__ == "__main__":`
+            # 之前）调用一次 `multiprocessing.freeze_support()`，这是
+            # Windows 上任何使用 multiprocessing 的 frozen 应用的标准要求，
+            # 并非本包可以从库内部代为保证的事情。
+            is_frozen = getattr(sys, "frozen", False)
 
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=popen_env,
-            )
+            if is_frozen:
+                logger.info(
+                    "[Daemon] 检测到 frozen 环境 (PyInstaller等)，"
+                    "使用 multiprocessing.Process 启动 daemon"
+                )
+
+                from download_daemon import run_daemon_process
+
+                # multiprocessing 子进程（Windows 下为 spawn）会继承父进程
+                # 启动时刻的环境变量，因此这里直接写入 os.environ 而不是像
+                # subprocess.Popen 那样通过 env= 参数传递一份独立副本。
+                for _k, _v in popen_env.items():
+                    os.environ[_k] = _v
+
+                mp_kwargs = dict(
+                    session=session_daemon_path,
+                    account_id=account_id,
+                    ipc_socket=ipc_socket,
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    log_level=log_level,
+                    watchdog_timeout=watchdog_timeout,
+                )
+                if self._unified_log_path:
+                    mp_kwargs["log_file"] = self._unified_log_path
+
+                logger.info(
+                    f"[Daemon] 启动参数 (multiprocessing): "
+                    f"account_id={account_id}, ipc_socket={ipc_socket}, "
+                    f"log_level={log_level}, watchdog_timeout={watchdog_timeout}"
+                )
+
+                mp_process = multiprocessing.Process(
+                    target=run_daemon_process,
+                    kwargs=mp_kwargs,
+                    daemon=False,
+                )
+                mp_process.start()
+                process = _MultiprocessingDaemonHandle(mp_process)
+
+            else:
+                daemon_script = os.path.join(os.path.dirname(__file__), 'download_daemon.py')
+                cmd = [
+                    sys.executable,
+                    daemon_script,
+                    '--session', session_daemon_path,
+                    '--account-id', account_id,
+                    '--ipc-socket', ipc_socket,
+                    '--log-level', log_level,
+                    '--watchdog-timeout', str(watchdog_timeout),
+                    '--api-id', str(api_id),
+                    '--api-hash', api_hash,
+                ]
+                # 传递统一日志路径给 daemon
+                if self._unified_log_path:
+                    cmd.extend(['--log-file', self._unified_log_path])
+
+                logger.info(f"[Daemon] 启动命令: {' '.join(cmd)}")
+
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=popen_env,
+                )
 
             logger.info(f"[Daemon] 进程已启动 PID={process.pid}")
 
@@ -1046,6 +1169,9 @@ class AccountScheduler:
                 logger.warning(f"[Daemon] 写入 pidfile 失败（非致命）: {pidfile_err}")
 
             # [LOG] Drain daemon stdout/stderr for diagnostics (ACK timeouts, IPC errors)
+            # frozen(multiprocessing) 模式下 process.stdout/stderr 均为 None，
+            # _start_daemon_pipe_logger 内部的 `if process.stdout:` 判断会
+            # 直接跳过——daemon 自身的文件日志始终是权威来源，不受影响。
             _start_daemon_pipe_logger(process, f"(PID={process.pid}, account={account_id})")
 
             # [LOG] Early exit detection

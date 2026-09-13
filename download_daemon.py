@@ -369,36 +369,57 @@ def parse_arguments():
 
 
 # ==================== 主函数 ====================
-async def daemon_main():
+async def daemon_main(
+    session: str,
+    account_id: str,
+    ipc_socket: str,
+    api_id: int,
+    api_hash: str,
+    log_level: str = "INFO",
+    watchdog_timeout: int = 60,
+    log_file: Optional[str] = None,
+):
     """
     Daemon主函数
 
     流程：
-    1. 解析命令行参数
-    2. 初始化日志
-    3. 导入依赖模块
-    4. 建立IPC连接
-    5. 启动Daemon核心
-    6. 启动Watchdog监控
-    7. 处理信号
-    8. 等待关闭
-    """
-    # 步骤1：解析参数
-    args = parse_arguments()
+    1. 初始化日志
+    2. 导入依赖模块
+    3. 建立IPC连接
+    4. 启动Daemon核心
+    5. 启动Watchdog监控
+    6. 处理信号
+    7. 等待关闭
 
-    # 步骤2：初始化日志
-    setup_logging(args.account_id, args.log_level, log_file_override=args.log_file)
+    [FIX-2026-09-13-FROZEN-DAEMON-ENTRYPOINT] 此前该函数内部直接调用
+    parse_arguments() 读取 sys.argv，只能通过命令行 `python download_daemon.py
+    --session ... --account-id ...` 的方式启动。这在 PyInstaller 打包后的
+    宿主应用中会失效：sys.executable 此时指向宿主自身编译出的 exe（而非通用
+    Python 解释器），该 exe 有自己的 argparse 子命令体系，把
+    download_daemon.py 的路径当成第一个位置参数传进去只会触发宿主 exe 自身
+    的 "invalid choice" 用法错误，daemon 进程根本不会真正启动，IPC 端口上
+    也就永远没有东西在监听（对应 [WinError 1225] The remote computer refused
+    the network connection）。
+    现在 daemon_main() 直接接受显式参数，不再耦合于 argparse/sys.argv，
+    这样宿主应用可以在 frozen 模式下通过 multiprocessing.Process 直接调用
+    run_daemon_process()（见下）以编程方式启动 daemon，完全绕开
+    "用 sys.executable 执行一个 .py 脚本路径" 这个在 frozen 场景下站不住脚的
+    假设。命令行调用方式（main() / parse_arguments()）保持完全不变，
+    仅作为在此基础上的一层薄封装。
+    """
+    # 初始化日志
+    setup_logging(account_id, log_level, log_file_override=log_file)
 
     logger.info("=" * 60)
     logger.info("Daemon进程启动")
     logger.info("=" * 60)
-    logger.info(f"[Init] 账号ID: {args.account_id}")
-    logger.info(f"[Init] Session路径: {args.session}")
-    logger.info(f"[Init] IPC路径: {args.ipc_socket}")
-    logger.info(f"[Init] Watchdog超时: {args.watchdog_timeout}秒")
+    logger.info(f"[Init] 账号ID: {account_id}")
+    logger.info(f"[Init] Session路径: {session}")
+    logger.info(f"[Init] IPC路径: {ipc_socket}")
+    logger.info(f"[Init] Watchdog超时: {watchdog_timeout}秒")
 
     try:
-        # 步骤3：导入依赖模块
+        # 步骤1：导入依赖模块
         logger.info("[Init] 导入依赖模块...")
         from download_ipc import IPCChannel
         from download_event_bus import EventBus
@@ -426,43 +447,43 @@ async def daemon_main():
                 def request_shutdown(self):
                     self.shutdown_requested = True
 
-        # 步骤4：建立IPC连接
+        # 步骤2：建立IPC连接
         logger.info("[Init] 建立IPC连接...")
         # 判断是否为socket路径或TCP端口
-        if args.ipc_socket.isdigit():
+        if ipc_socket.isdigit():
             # TCP端口
-            ipc = IPCChannel(tcp_port=int(args.ipc_socket))
+            ipc = IPCChannel(tcp_port=int(ipc_socket))
         else:
             # Unix socket路径
-            ipc = IPCChannel(socket_path=args.ipc_socket)
+            ipc = IPCChannel(socket_path=ipc_socket)
 
         # 连接为服务端（等待主进程客户端连接）
         await ipc.connect(is_server=True)
         logger.info("[Init] IPC服务端已启动，等待主进程连接...")
 
-        # 步骤5：初始化EventBus
+        # 步骤3：初始化EventBus
         event_bus = EventBus()
         logger.info("[Init] 事件总线已初始化")
 
-        # 步骤6：初始化Daemon核心
+        # 步骤4：初始化Daemon核心
         logger.info("[Init] 初始化Daemon核心...")
         daemon_core = DaemonCore(
-            session_path=args.session,
-            account_id=args.account_id,
+            session_path=session,
+            account_id=account_id,
             ipc_channel=ipc,
             event_bus=event_bus,
-            api_id=args.api_id,
-            api_hash=args.api_hash
+            api_id=api_id,
+            api_hash=api_hash
         )
 
-        # 步骤7：初始化看门狗
+        # 步骤5：初始化看门狗
         watchdog = DaemonWatchdog(
             ipc_channel=ipc,
             daemon_core=daemon_core,
-            timeout=args.watchdog_timeout
+            timeout=watchdog_timeout
         )
 
-        # 步骤8：设置信号处理器
+        # 步骤6：设置信号处理器
         signal_handler = SignalHandler(daemon_core)
         signal.signal(signal.SIGTERM, signal_handler.handle_sigterm)
         signal.signal(signal.SIGINT, signal_handler.handle_sigint)
@@ -472,7 +493,7 @@ async def daemon_main():
         logger.info("Daemon初始化完成，启动主循环")
         logger.info("=" * 60)
 
-        # 步骤9：并发运行daemon核心和watchdog监控
+        # 步骤7：并发运行daemon核心和watchdog监控
         try:
             await asyncio.gather(
                 daemon_core.run(),
@@ -482,7 +503,7 @@ async def daemon_main():
         except Exception as e:
             logger.error(f"[Error] 主循环异常: {e}", exc_info=True)
 
-        # 步骤10：优雅关闭
+        # 步骤8：优雅关闭
         logger.info("[Shutdown] 关闭Daemon...")
         await daemon_core.shutdown()
         await ipc.close()
@@ -525,13 +546,75 @@ def _install_crash_logger():
     sys.excepthook = _crash_hook
 
 
-# ==================== 进程入口 ====================
+# ==================== 进程入口（命令行方式，行为保持不变） ====================
 def main():
-    """进程入口点"""
+    """进程入口点（命令行方式：`python download_daemon.py --session ... `）"""
     _install_crash_logger()
     try:
-        # 运行async main函数
-        asyncio.run(daemon_main())
+        # 解析命令行参数，转换为 daemon_main() 的显式参数
+        args = parse_arguments()
+        asyncio.run(daemon_main(
+            session=args.session,
+            account_id=args.account_id,
+            ipc_socket=args.ipc_socket,
+            api_id=args.api_id,
+            api_hash=args.api_hash,
+            log_level=args.log_level,
+            watchdog_timeout=args.watchdog_timeout,
+            log_file=args.log_file,
+        ))
+        sys.exit(0)
+
+    except KeyboardInterrupt:
+        logger.warning("[Shutdown] 用户中断")
+        sys.exit(0)
+
+    except BaseException as e:
+        logger.critical(f"[Fatal] 未处理的异常: {e}", exc_info=True)
+        sys.exit(1)
+
+
+# ==================== 进程入口（编程方式，供 multiprocessing.Process 使用） ====================
+def run_daemon_process(
+    session: str,
+    account_id: str,
+    ipc_socket: str,
+    api_id: int,
+    api_hash: str,
+    log_level: str = "INFO",
+    watchdog_timeout: int = 60,
+    log_file: Optional[str] = None,
+) -> None:
+    """
+    [FIX-2026-09-13-FROZEN-DAEMON-ENTRYPOINT] Daemon 的“编程方式”入口点。
+
+    与 main() 唯一的区别是：不经过 argparse / sys.argv，而是直接接收显式
+    参数。这是一个模块级、可被 pickle 的普通函数，因此可以直接作为
+    `multiprocessing.Process(target=run_daemon_process, kwargs={...})` 的
+    target 使用——这正是宿主应用在 PyInstaller frozen 模式下启动 daemon 所
+    需要的方式：frozen 场景下 sys.executable 指向宿主自身编译出的 exe，而不
+    是通用 Python 解释器，因此不能再用
+    `subprocess.Popen([sys.executable, "download_daemon.py", ...])`
+    这种“把脚本路径当命令行参数丢给解释器”的方式启动 daemon；而
+    multiprocessing.Process 在 spawn 模式下会正确地重新执行宿主自身的 exe
+    并在子进程中直接调用这里指定的 Python 函数，完全不依赖 argparse 或者
+    “某个 .py 文件路径”这种在 frozen 环境下已经失效的假设。
+
+    命令行方式（main()）行为不受任何影响，两者内部都只是薄封装，最终都调用
+    同一个 daemon_main()。
+    """
+    _install_crash_logger()
+    try:
+        asyncio.run(daemon_main(
+            session=session,
+            account_id=account_id,
+            ipc_socket=ipc_socket,
+            api_id=api_id,
+            api_hash=api_hash,
+            log_level=log_level,
+            watchdog_timeout=watchdog_timeout,
+            log_file=log_file,
+        ))
         sys.exit(0)
 
     except KeyboardInterrupt:

@@ -168,6 +168,26 @@ The SDK provides 4 async methods: `start()`, `download()`, `cancel()`, `shutdown
 
 ---
 
+## Using Inside a PyInstaller-Frozen App
+
+If you're bundling your application with PyInstaller (or a similar freezer) into a standalone `.exe`, there's one extra step: call `multiprocessing.freeze_support()` at the very start of your app's entry point, before any other code runs.
+
+```python
+import multiprocessing
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()  # must be first — required on frozen Windows apps
+    main()
+```
+
+**Why this is needed:** in a frozen build, `sys.executable` points at your own compiled `.exe` rather than a generic Python interpreter. The SDK detects this (`sys.frozen`) and launches its download daemon via `multiprocessing.Process` instead of `subprocess.Popen([sys.executable, "download_daemon.py", ...])`, since the latter would have your `.exe` try to parse a script path as one of its own CLI arguments and fail immediately. `multiprocessing.freeze_support()` is what makes `multiprocessing.Process` work correctly inside a frozen Windows executable — it's a standard requirement of the `multiprocessing` module itself, not something specific to this SDK, but it's easy to miss if you don't already use `multiprocessing` elsewhere in your app.
+
+Without this call, the daemon process may fail to start (or, on some platforms, spawn recursively) when running from the packaged `.exe`, even though everything works fine when running from source.
+
+This only applies to frozen builds — running from source or a normal venv install requires no changes and is unaffected either way.
+
+---
+
 ## What [TeleBackup](https://chatdex.cc) SDK Handles
 
 If you're building a Telegram downloader and hitting these errors, [TeleBackup](https://chatdex.cc) SDK already handles them:
@@ -213,6 +233,8 @@ If you're building a Telegram downloader and hitting these errors, [TeleBackup](
 **Download stalls** — Watchdog auto-recovers after 30s. Check logs for `[WATCHDOG]` entries.
 
 **`WinError 32`** — Auto-retried. If persistent, another process may be holding the file open.
+
+**`WinError 1225: The remote computer refused the network connection`** (packaged/frozen apps only) — The daemon process failed to start because `multiprocessing.freeze_support()` wasn't called at your app's entry point. See [Using Inside a PyInstaller-Frozen App](#using-inside-a-pyinstaller-frozen-app) above.
 
 ---
 
