@@ -377,6 +377,12 @@ class AccountScheduler:
         self.active_account_id: Optional[str] = None
         self.account_daemons: Dict[str, 'DaemonProcess'] = {}
         self.ipc_channels: Dict[str, 'IPCChannel'] = {}
+        # [FIX-2026-09-14-SHUTDOWN-RECONNECT-RACE] 标记某个账号当前是否正在
+        # 走 _shutdown_daemon() 流程。_start_ipc_receive_loop 在决定"连接
+        # 断开是否需要自动重连"之前会检查这个标记——daemon 关闭时主动断开
+        # 的 IPC 连接不应被当成意外断线去重连，见下方 _shutdown_daemon /
+        # _start_ipc_receive_loop 中的详细说明。
+        self._shutdown_in_progress: Dict[str, bool] = {}
 
         # ✅ [FIX-2026-02-01] IPC 接收循环任务字典
         # 【问题】主进程缺少 IPC 接收循环，导致 ACK 和事件无法被处理
@@ -1468,6 +1474,22 @@ class AccountScheduler:
                     # daemon 已经不在了，重连注定失败，此时应尽快放弃并退出循环，
                     # 而不是无意义地反复重试。
                     if not ipc.is_connected():
+                        # [FIX-2026-09-14-SHUTDOWN-RECONNECT-RACE] 如果这次
+                        # 断开是 _shutdown_daemon() 主动发起关闭流程导致的
+                        # （daemon 处理完 ShutdownRequest 后会主动关闭它那
+                        # 一侧的 socket），这是完全预期之内的断开，不应该
+                        # 被当成"意外断线"去重连——_shutdown_daemon() 自己
+                        # 随后就会取消这个接收任务。之前没有这个判断时，
+                        # 每次优雅关闭都会先打一条误导性的"检测到连接断开，
+                        # 尝试重连"日志，才轮到真正的取消逻辑生效。
+                        if self._shutdown_in_progress.get(account_id):
+                            logger.info(
+                                f"[IPC-Receiver] 连接断开发生在正常关闭流程中"
+                                f" (account_id={account_id})，不视为意外断线，"
+                                "等待外部取消接收任务"
+                            )
+                            break
+
                         daemon = self.account_daemons.get(account_id)
                         daemon_alive = daemon is not None and daemon.is_running()
 
@@ -1710,6 +1732,15 @@ class AccountScheduler:
                 f"[Daemon] 关闭进程: {account_id} (save_state={save_state})"
             )
 
+            # [FIX-2026-09-14-SHUTDOWN-RECONNECT-RACE] 标记该账号正在关闭。
+            # daemon 端在处理完 ShutdownRequest 后会主动关闭它那一侧的 IPC
+            # socket，而 _start_ipc_receive_loop 此时可能仍在运行（它要等
+            # 到本函数后面取消接收任务那一步才会停止，见下方"步骤2.5"），
+            # 如果不设这个标记，它会把这次预期之内的断开误判为意外断线，
+            # 进而触发自动重连逻辑——重连一个即将被关闭、根本不该继续存在
+            # 的连接，产生一堆无意义的 "检测到连接断开，尝试重连" 日志。
+            self._shutdown_in_progress[account_id] = True
+
             # 步骤1：获取daemon对象
             daemon = self.account_daemons.get(account_id)
             ipc = self.ipc_channels.get(account_id)
@@ -1821,6 +1852,13 @@ class AccountScheduler:
 
         except Exception as e:
             logger.error(f"[Daemon] 关闭失败 {account_id}: {e}", exc_info=True)
+
+        finally:
+            # [FIX-2026-09-14-SHUTDOWN-RECONNECT-RACE] 无论关闭成功与否，
+            # 都要清掉这个标记——否则如果同一个 account_id 之后又重新启动
+            # 了一个新的 daemon，它的接收循环会永远被误认为"正在关闭中"，
+            # 导致真正意外的断线也再也不会自动重连。
+            self._shutdown_in_progress.pop(account_id, None)
 
     async def _submit_to_daemon(self, account_id: str, task: DownloadTask):
         """将任务提交给Daemon"""
