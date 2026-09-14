@@ -633,7 +633,29 @@ def main():
         logger.warning("[Shutdown] 用户中断")
         sys.exit(0)
 
+    except SystemExit:
+        # [FIX-2026-09-14-SPURIOUS-FATAL-ON-CLEAN-EXIT] 上面 sys.exit(0)
+        # 自己触发的 SystemExit 会先经过这里——必须原样放行，否则会被下面
+        # 的 `except BaseException` 当成"未处理的异常"捕获（SystemExit 本
+        # 身就是 BaseException 的子类）。放行前不做任何事，这样无论
+        # sys.exit() 是在这个 try 块的哪一处被调用的（正常完成后的
+        # sys.exit(0)，还是别处传播上来的其他退出码），都能保留其原本的
+        # 退出码，不会被这里错误地改写。
+        raise
+
     except BaseException as e:
+        # [FIX-2026-09-14-SPURIOUS-FATAL-ON-CLEAN-EXIT] 修复前，这里会捕获
+        # 到上面 `sys.exit(0)` 自己抛出的 SystemExit(0)（因为没有先单独
+        # 处理 SystemExit，而 SystemExit 正是 BaseException 的子类），
+        # 导致每一次完全正常、优雅关闭的运行都会：
+        #   1) 打印一条误导性的 "[Fatal] 未处理的异常: 0" CRITICAL 日志，
+        #      看起来像是出错了，实际只是进程按预期退出；
+        #   2) 用这里的 sys.exit(1) 覆盖掉原本的 sys.exit(0)，导致进程
+        #      退出码永远是 1（失败），即使一切都成功完成——这会破坏任何
+        #      依赖退出码判断成功/失败的上层逻辑。
+        # 加上前面的 `except SystemExit: raise` 后，这里只会捕获真正意外
+        # 的异常（例如 daemon_main() 内部未被捕获的其他 BaseException），
+        # 行为符合这条日志本身的语义。
         logger.critical(f"[Fatal] 未处理的异常: {e}", exc_info=True)
         sys.exit(1)
 
@@ -685,7 +707,14 @@ def run_daemon_process(
         logger.warning("[Shutdown] 用户中断")
         sys.exit(0)
 
+    except SystemExit:
+        # [FIX-2026-09-14-SPURIOUS-FATAL-ON-CLEAN-EXIT] 见 main() 中同名注释：
+        # 必须原样放行 sys.exit(0) 自己触发的 SystemExit，否则会被下面的
+        # `except BaseException` 误当成"未处理的异常"捕获并覆盖退出码。
+        raise
+
     except BaseException as e:
+        # [FIX-2026-09-14-SPURIOUS-FATAL-ON-CLEAN-EXIT] 见 main() 中同名注释。
         logger.critical(f"[Fatal] 未处理的异常: {e}", exc_info=True)
         sys.exit(1)
 
