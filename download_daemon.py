@@ -519,12 +519,51 @@ async def daemon_main(
         logger.info("=" * 60)
 
         # 步骤7：并发运行daemon核心和watchdog监控
+        #
+        # [FIX-2026-09-14-WATCHDOG-EARLY-STOP] 之前这里用
+        # `asyncio.gather(daemon_core.run(), watchdog.monitor(),
+        # return_exceptions=True)`。gather() 会等到*两个*任务都结束才返回
+        # ——但 daemon_core.run() 在优雅关闭（收到 SHUTDOWN_REQUEST）时几乎
+        # 立刻就会退出主循环返回，而 watchdog.monitor() 是一个完全独立的
+        # `while not self.dead:` 循环，没有任何机制知道 daemon_core 已经
+        # 关闭。self.dead 只会在 watchdog 自己判定"IPC断连超过60秒"、真正
+        # 触发自杀时才会被设为 True。
+        #
+        # 结果：即便 daemon_core 一侧已经优雅关闭完毕，gather() 仍会继续
+        # 等待 watchdog.monitor()，而 watchdog 会继续按 5 秒一次的频率轮询
+        # 那个即将被关闭的 IPC 连接，直到最多 60 秒后才会自行判定超时、
+        # 触发自杀退出——也就是说，一次"优雅关闭"实际上会让进程在后台
+        # 多挂起长达 60 秒，才会真正退出。
+        #
+        # 现在改用 asyncio.wait(..., return_when=FIRST_COMPLETED)：
+        # daemon_core.run() 和 watchdog.monitor() 任意一个先结束，就立刻
+        # 取消另一个并继续走后面的关闭流程，不再等待 watchdog 自己按超时
+        # 退出。
+        tasks = [
+            asyncio.create_task(daemon_core.run(), name="daemon_core.run"),
+            asyncio.create_task(watchdog.monitor(), name="watchdog.monitor"),
+        ]
         try:
-            await asyncio.gather(
-                daemon_core.run(),
-                watchdog.monitor(),
-                return_exceptions=True
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED
             )
+
+            # 确保 watchdog 内部状态也标记为已停止（即便它不是先结束的那个）
+            watchdog.stop()
+
+            for t in pending:
+                t.cancel()
+            if pending:
+                # 等待被取消的任务真正退出，吞掉预期中的 CancelledError
+                await asyncio.wait(pending)
+
+            for t in done:
+                exc = t.exception() if not t.cancelled() else None
+                if exc:
+                    logger.error(
+                        f"[Error] 主循环异常 ({t.get_name()}): {exc}",
+                        exc_info=exc,
+                    )
         except Exception as e:
             logger.error(f"[Error] 主循环异常: {e}", exc_info=True)
 
