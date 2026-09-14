@@ -215,8 +215,33 @@ class DaemonWatchdog:
 
         finally:
             # 步骤4：退出进程（无论如何）
+            #
+            # [FIX-2026-09-14-WATCHDOG-SIGKILL-WINDOWS] 之前这里用
+            # `os.kill(os.getpid(), signal.SIGKILL)` 强制退出进程。SIGKILL
+            # 是 POSIX 专属信号，Windows 的 signal 模块根本没有这个属性，
+            # 调用会直接抛出 AttributeError:
+            #   module 'signal' has no attribute 'SIGKILL'
+            #
+            # 由于这行代码在 finally 块内、且没有被 try/except 包裹，这个
+            # AttributeError 会一路抛出 _graceful_suicide()，被 monitor()
+            # 外层的 `except Exception` 捕获、记录为 "[Watchdog] 监控异常"
+            # 后继续循环——但 self.dead 从未被设为 True，也从未真正调用
+            # os._exit/sys.exit 退出进程，导致 monitor() 的 while 循环
+            # 永远不会停止：每隔 check_interval 秒就重新判定"IPC断连超时"，
+            # 再次尝试 SIGKILL 自杀，再次抛出同样的 AttributeError，如此
+            # 无限循环——daemon 进程实际上变成了一个永远杀不死、每隔几秒
+            # 打印同一组日志的僵尸进程，必须手动在任务管理器里结束进程。
+            #
+            # 改用 os._exit()：这是唯一在 POSIX 和 Windows 上都保证立即终止
+            # 进程、且不能被任何异常处理器拦截或被 asyncio 取消的方式
+            # （不同于 sys.exit()，后者只是抛出 SystemExit，可能只取消当前
+            # 协程/任务而不会真正终止进程）。这里选用退出码 1
+            # 表示"非正常路径下的自我终止"。此调用之前的所有清理步骤
+            # （保存 checkpoint、关闭 daemon_core、关闭 IPC）均已在上面的
+            # try 块中尽力完成，os._exit() 只是确保无论如何都不会卡在
+            # 一个杀不掉自己的僵尸循环里。
             logger.critical("[Watchdog] Daemon进程即将退出")
-            os.kill(os.getpid(), signal.SIGKILL)
+            os._exit(1)
 
     def stop(self):
         """停止监控"""
