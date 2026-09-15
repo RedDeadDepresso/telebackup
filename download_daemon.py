@@ -512,6 +512,34 @@ async def daemon_main(
         signal_handler = SignalHandler(daemon_core)
         signal.signal(signal.SIGTERM, signal_handler.handle_sigterm)
         signal.signal(signal.SIGINT, signal_handler.handle_sigint)
+
+        # [FIX-2026-09-14-IGNORE-BROADCAST-CTRL-BREAK] 在 Windows 上，daemon
+        # 是通过 multiprocessing.Process 由宿主应用（例如 frozen 模式下的
+        # KKAFIO CLI）内部启动的。默认情况下，除非子进程显式使用了
+        # CREATE_NEW_PROCESS_GROUP 单独建组，否则它会加入其父进程所在的
+        # 控制台进程组——这意味着，如果宿主应用的 GUI 外壳（例如 MXU）为了
+        # 实现"优雅停止"而向宿主进程广播 CTRL_BREAK_EVENT，这个信号事件也会
+        # 一并广播到本 daemon 进程。
+        #
+        # 如果不特殊处理，daemon 在没有为 SIGBREAK 注册任何处理器的情况下，
+        # 会被 Windows 的默认行为直接终止——不会运行任何 Python 清理代码
+        # （不会断开 TelegramClient、不会保存 checkpoint、不会走
+        # DaemonCore.shutdown()），效果等同于一次没有任何预警的强制杀死，
+        # 这恰恰是我们花了大量精力才修好的"优雅关闭"流程本应避免的情况。
+        #
+        # 正确的关闭方式应该只有一条路径：宿主进程捕获到同一个
+        # CTRL_BREAK_EVENT 后，通过已有的 IPC 通道发送正式的
+        # SHUTDOWN_REQUEST（宿主侧的信号处理見 kkafio_cli.py 的
+        # install_graceful_stop_handler()）——这样 daemon 才能走完整套已经
+        # 验证过的优雅关闭流程（取消进行中的下载、保存 checkpoint、断开
+        # TelegramClient、清理 DC 连接池），而不是被同一个广播信号原地打断。
+        #
+        # 因此这里显式忽略 SIGBREAK，让 daemon 只响应 IPC 层面的
+        # SHUTDOWN_REQUEST（以及自身 Watchdog 在 IPC 意外断连时的兜底自杀，
+        # 这套逻辑本身不依赖 SIGBREAK，不受影响）。
+        if sys.platform == "win32" and hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, signal.SIG_IGN)
+
         logger.info("[Init] 信号处理器已注册")
 
         logger.info("=" * 60)
