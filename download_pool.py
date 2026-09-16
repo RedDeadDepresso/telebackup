@@ -2473,16 +2473,31 @@ class WorkerPool:
                             else:
                                 eta_str = "计算中..."
 
-                            # 终端实时输出（用\r覆盖上一行）
-                            print(
-                                f"\r[下载] {progress_pct:5.1f}% | "
+                            # [FIX-2026-09-14-PRINT-TO-LOGGER] 之前这里用
+                            # print(..., end='', flush=True) 配合 \r 在终端
+                            # 里原地刷新一行进度条。这个 print() 完全绕过了
+                            # logging 模块——不受任何 logger 级别/handler 配置
+                            # 影响，也不会被想要"精简/关闭 teleget 的 INFO
+                            # 级别输出"的宿主应用（例如 frozen 模式下的
+                            # KKAFIO）过滤掉。此外，\r 控制字符在非真实终端
+                            # 的场景下（例如宿主应用把子进程 stdout 按行读取
+                            # 并显示在 GUI 日志面板里）通常会显示异常，因为
+                            # 这一行本身不以换行符结尾。
+                            #
+                            # 改成 logger.info() 之后，这行进度信息会像
+                            # daemon 里其它所有日志一样，遵循标准的 logger
+                            # 级别与 handler 配置——宿主应用现在可以按级别
+                            # （例如把 teleget 相关 logger 的级别调到
+                            # WARNING）统一控制是否展示这些高频进度更新，
+                            # 而不必依赖解析原始 stdout 内容。
+                            logger.info(
+                                f"[下载] {progress_pct:5.1f}% | "
                                 f"{self._total_downloaded/(1024**3):6.2f}/{self._total_file_size/(1024**3):6.2f} GB | "
                                 f"瞬时: {current_speed_mbps:7.2f} MB/s | "
                                 f"平均: {avg_speed_mbps:7.2f} MB/s | "
                                 f"连接数: {self.client_pool.size:2d} | "
                                 f"Parts: {self._parts_done}/{self._total_parts} | "
-                                f"ETA: {eta_str:>9s}",
-                                end='', flush=True
+                                f"ETA: {eta_str:>9s}"
                             )
 
                             self._last_speed_log_time = now
