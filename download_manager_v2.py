@@ -1046,6 +1046,14 @@ class AccountScheduler:
 
             # 步骤3：启动daemon subprocess
             log_level = self.config.get('daemon_log_level', 'INFO')
+            # [FIX-2026-09-14-DECOUPLE-CONSOLE-LOG-LEVEL] 可选，单独控制
+            # daemon 控制台输出的级别，与文件日志级别（始终为 log_level）
+            # 解耦。为 None 时保持原有行为（控制台与文件用同一个级别）。
+            # 例如宿主应用希望文件保留完整 INFO/DEBUG 细节以便事后排查，
+            # 但完全不想让这些内容出现在自己捕获显示的控制台/界面上时，
+            # 可以传入 daemon_console_log_level='CRITICAL' 达到"文件详细、
+            # 控制台静音"的效果。
+            console_log_level = self.config.get('daemon_console_log_level', None)
             watchdog_timeout = self.config.get('daemon_watchdog_timeout', 60)
 
             # 设置统一日志（主进程 + daemon 共享同一个日志文件）
@@ -1120,6 +1128,8 @@ class AccountScheduler:
                 )
                 if self._unified_log_path:
                     mp_kwargs["log_file"] = self._unified_log_path
+                if console_log_level:
+                    mp_kwargs["console_log_level"] = console_log_level
 
                 logger.info(
                     f"[Daemon] 启动参数 (multiprocessing): "
@@ -1151,6 +1161,8 @@ class AccountScheduler:
                 # 传递统一日志路径给 daemon
                 if self._unified_log_path:
                     cmd.extend(['--log-file', self._unified_log_path])
+                if console_log_level:
+                    cmd.extend(['--console-log-level', console_log_level])
 
                 logger.info(f"[Daemon] 启动命令: {' '.join(cmd)}")
 

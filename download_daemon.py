@@ -272,14 +272,32 @@ class SignalHandler:
 
 
 # ==================== 日志配置 ====================
-def setup_logging(account_id: str, log_level: str, log_file_override: str = None):
+def setup_logging(
+    account_id: str,
+    log_level: str,
+    log_file_override: str = None,
+    console_log_level: str = None,
+):
     """
     设置daemon日志
 
     Args:
         account_id: 账号ID（用于日志文件名）
-        log_level: 日志级别（DEBUG/INFO/WARNING/ERROR）
+        log_level: 日志级别（DEBUG/INFO/WARNING/ERROR），同时作为文件和
+            （在 console_log_level 未指定时）控制台处理器的级别
         log_file_override: 统一日志文件路径（与主进程共享），为 None 时使用独立文件
+        console_log_level: [FIX-2026-09-14-DECOUPLE-CONSOLE-LOG-LEVEL]
+            可选，单独控制控制台处理器的级别，与文件处理器的级别（始终为
+            log_level）解耦。为 None 时保持原有行为——控制台和文件使用同一个
+            级别。
+
+            这个参数存在的原因：宿主应用（例如以 frozen 模式运行、且自身
+            stdout 会被外部 GUI 捕获显示的 KKAFIO）可能希望 daemon 把完整
+            细节写入日志文件（便于事后排查问题），但完全不想让这些内容出现
+            在自己的控制台/界面上——此前 log_level 同时控制两者，没有办法
+            单独做到"文件详细、控制台安静（甚至完全静音）"。传入
+            "CRITICAL"（比默认可能触发的最高级别日志还高）等效于完全关闭
+            控制台输出，同时文件仍完整记录。
     """
     # 创建logs目录
     os.makedirs("logs", exist_ok=True)
@@ -296,11 +314,17 @@ def setup_logging(account_id: str, log_level: str, log_file_override: str = None
     )
     date_format = "%Y-%m-%d %H:%M:%S"
 
-    # 配置root logger
+    # 配置root logger：级别必须保持足够宽松（取 log_level 和
+    # console_log_level 中较低的一个），否则记录还没到 handler 过滤这一步，
+    # 就已经被 logger 自身的级别挡掉了——文件 handler 也会一并收不到。
     root_logger = logging.getLogger()
-    root_logger.setLevel(getattr(logging, log_level))
+    _effective_levels = [getattr(logging, log_level)]
+    if console_log_level:
+        _effective_levels.append(getattr(logging, console_log_level))
+    root_logger.setLevel(min(_effective_levels))
 
-    # 文件处理器（追加模式，与主进程共享）
+    # 文件处理器（追加模式，与主进程共享）——始终使用 log_level，不受
+    # console_log_level 影响。
     file_handler = logging.FileHandler(log_file, encoding='utf-8')
     file_handler.setLevel(getattr(logging, log_level))
     file_handler.setFormatter(
@@ -308,12 +332,15 @@ def setup_logging(account_id: str, log_level: str, log_file_override: str = None
     )
     root_logger.addHandler(file_handler)
 
-    # 控制台处理器
+    # 控制台处理器——若指定了 console_log_level 则单独使用它，
+    # 否则回退到原有行为（与 log_level 一致）。
     # [FIX-2026-02-01] Ensure stdio can encode unicode logs on Windows GBK consoles.
     # This prevents UnicodeEncodeError when log lines contain non-ASCII symbols.
     _ensure_utf8_stdio()
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(getattr(logging, log_level))
+    console_handler.setLevel(
+        getattr(logging, console_log_level) if console_log_level else getattr(logging, log_level)
+    )
     console_handler.setFormatter(
         logging.Formatter(log_format, datefmt=date_format)
     )
@@ -378,6 +405,16 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        '--console-log-level',
+        default=None,
+        help=(
+            '[FIX-2026-09-14-DECOUPLE-CONSOLE-LOG-LEVEL] 单独指定控制台'
+            '日志级别，与 --log-level 解耦（文件日志始终使用 --log-level）。'
+            '默认与 --log-level 相同。'
+        )
+    )
+
+    parser.add_argument(
         '--api-id',
         type=int,
         required=True,
@@ -403,6 +440,7 @@ async def daemon_main(
     log_level: str = "INFO",
     watchdog_timeout: int = 60,
     log_file: Optional[str] = None,
+    console_log_level: Optional[str] = None,
 ):
     """
     Daemon主函数
@@ -431,9 +469,16 @@ async def daemon_main(
     "用 sys.executable 执行一个 .py 脚本路径" 这个在 frozen 场景下站不住脚的
     假设。命令行调用方式（main() / parse_arguments()）保持完全不变，
     仅作为在此基础上的一层薄封装。
+
+    console_log_level: [FIX-2026-09-14-DECOUPLE-CONSOLE-LOG-LEVEL] 见
+    setup_logging() 的文档字符串。为 None 时保持原有行为不变。
     """
     # 初始化日志
-    setup_logging(account_id, log_level, log_file_override=log_file)
+    setup_logging(
+        account_id, log_level,
+        log_file_override=log_file,
+        console_log_level=console_log_level,
+    )
 
     logger.info("=" * 60)
     logger.info("Daemon进程启动")
@@ -654,6 +699,7 @@ def main():
             log_level=args.log_level,
             watchdog_timeout=args.watchdog_timeout,
             log_file=args.log_file,
+            console_log_level=args.console_log_level,
         ))
         sys.exit(0)
 
@@ -698,6 +744,7 @@ def run_daemon_process(
     log_level: str = "INFO",
     watchdog_timeout: int = 60,
     log_file: Optional[str] = None,
+    console_log_level: Optional[str] = None,
 ) -> None:
     """
     [FIX-2026-09-13-FROZEN-DAEMON-ENTRYPOINT] Daemon 的“编程方式”入口点。
@@ -716,6 +763,10 @@ def run_daemon_process(
 
     命令行方式（main()）行为不受任何影响，两者内部都只是薄封装，最终都调用
     同一个 daemon_main()。
+
+    console_log_level: [FIX-2026-09-14-DECOUPLE-CONSOLE-LOG-LEVEL] 见
+    setup_logging() 的文档字符串。为 None 时保持原有行为不变（控制台与
+    文件使用同一个 log_level）。
     """
     _install_crash_logger()
     try:
@@ -728,6 +779,7 @@ def run_daemon_process(
             log_level=log_level,
             watchdog_timeout=watchdog_timeout,
             log_file=log_file,
+            console_log_level=console_log_level,
         ))
         sys.exit(0)
 
